@@ -1,0 +1,11 @@
+# Verification image: Python (for engine tests + smoke client) plus the
+# static Docker CLI copied from the official image, so no package
+# installation is needed at build time.
+FROM python:3.11-slim
+
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+
+WORKDIR /workspace
+COPY . /workspace
+
+ENTRYPOINT ["bash", "scripts/entrypoint.sh"]

@@ -1,0 +1,52 @@
+# Compose for the deep-space lander grammar arbiter.
+#
+#   arbiter : the verdict service (configurable host port)
+#   verify  : one-shot acceptance; runs engine tests, builds the image,
+#             starts a sibling arbiter container, smokes the unique /
+#             ambiguous / non-consuming-cycle HTTP scenarios, exits
+#             with the aggregate status code.
+#
+# Host port configuration:
+#   ARBITER_HOST_PORT=9090 docker compose up --build
+services:
+  arbiter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: forest-arbiter:local
+    environment:
+      ARBITER_HOST: 0.0.0.0
+      ARBITER_PORT: "8080"
+      ARBITER_STORE: /data/sealed.json
+    ports:
+      - "${ARBITER_HOST_PORT:-8080}:8080"
+    volumes:
+      - arbiter-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import json,urllib.request; json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    image: forest-arbiter-verify:local
+    depends_on:
+      arbiter:
+        condition: service_healthy
+    environment:
+      # When run inside Compose, talk to the healthy arbiter service;
+      # the entrypoint still independently builds the image and starts a
+      # sibling container to satisfy the ordered acceptance contract.
+      ARBITER_BASE_URL: "http://arbiter:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # One-shot: run once and exit with the acceptance status code.
+    restart: "no"
+
+volumes:
+  arbiter-data:
