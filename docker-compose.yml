@@ -2,9 +2,12 @@
 #
 #   arbiter : the verdict service (configurable host port)
 #   verify  : one-shot acceptance; runs engine tests, builds the image,
-#             starts a sibling arbiter container, smokes the unique /
-#             ambiguous / non-consuming-cycle HTTP scenarios, exits
-#             with the aggregate status code.
+#             smokes the unique / ambiguous / non-consuming-cycle HTTP
+#             scenarios (incl. replay + conflict), then restarts the
+#             arbiter over its unchanged data volume to check that reads
+#             and equivalent retransmissions still return the complete
+#             tree evidence, and that legacy trimmed records are safely
+#             recovered; exits with the aggregate status code.
 #
 # Host port configuration:
 #   ARBITER_HOST_PORT=9090 docker compose up --build
@@ -40,8 +43,9 @@ services:
         condition: service_healthy
     environment:
       # When run inside Compose, talk to the healthy arbiter service;
-      # the entrypoint still independently builds the image and starts a
-      # sibling container to satisfy the ordered acceptance contract.
+      # the entrypoint still independently builds the image, and the
+      # smoke driver restarts this very arbiter container (data volume
+      # untouched) through the mounted docker socket.
       ARBITER_BASE_URL: "http://arbiter:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

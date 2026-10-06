@@ -63,6 +63,23 @@ def _compute(payload: dict) -> dict:
     return outcome
 
 
+def _recompute_conclusion(canonical_request: dict) -> dict:
+    """Rebuild a full conclusion from a frozen canonical request.
+
+    Used by the store to recover legacy entries whose accept evidence
+    was archived without derivation trees.  The engine is deterministic
+    and the canonical request carries the complete frozen input, so the
+    recomputed verdict and production-id sequences must (and are
+    verified by the store to) match the sealed remnants exactly.
+    """
+    return _compute(dict(canonical_request))
+
+
+def open_store(path: str) -> SealedStore:
+    """Open the sealed store with engine-backed legacy recovery."""
+    return SealedStore(path, recompute=_recompute_conclusion)
+
+
 def _loose_fingerprint(raw_body: bytes) -> str:
     import hashlib
 
@@ -224,7 +241,7 @@ class ArbiterHandler(BaseHTTPRequestHandler):
 
 def make_server(host: str, port: int, store: Optional[SealedStore] = None
                 ) -> Tuple[ThreadingHTTPServer, SealedStore]:
-    store = store or SealedStore(STORE_PATH)
+    store = store or open_store(STORE_PATH)
 
     class _Handler(ArbiterHandler):
         pass

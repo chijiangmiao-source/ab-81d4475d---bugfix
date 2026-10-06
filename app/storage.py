@@ -15,6 +15,23 @@ fingerprint.  Rules:
 
 The store is a single JSON file replaced atomically; a process-wide lock
 serializes writes.  Sealed entries are immutable.
+
+The full reviewable evidence (the unique derivation tree, or the two
+stable witness trees of an ambiguous acceptance) is part of the sealed
+conclusion and is persisted verbatim, so a restart over the same data
+volume replays byte-identical evidence.
+
+Stores written by older revisions may hold *incomplete* accept
+conclusions (the trees were stripped at archive time, leaving
+``archived_tree`` / ``archived_witnesses`` markers behind).  When the
+store is opened with a ``recompute`` callable, such legacy entries are
+safely recovered from their frozen canonical request: the recomputed
+conclusion is only adopted when its verdict and production-id
+sequence(s) exactly match the sealed remnants; otherwise the original
+entry is kept untouched.  Successful recoveries are persisted, so later
+restarts keep the restored evidence.  Recovery never changes audit ids,
+request fingerprints, seal timestamps, rejection conclusions, or the
+original evidence reported on conflicts.
 """
 
 from __future__ import annotations
@@ -65,9 +82,17 @@ def canonical_fingerprint(payload: dict) -> Tuple[str, dict]:
 
 
 class SealedStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, recompute=None) -> None:
+        """Open the store at ``path``.
+
+        ``recompute`` (optional) is called with a frozen
+        ``canonical_request`` and must return the full conclusion for
+        it; it is used to recover legacy entries whose accept evidence
+        was archived without derivation trees.
+        """
         self.path = path
         self._lock = threading.Lock()
+        self._recompute = recompute
         self._entries: Dict[str, dict] = {}
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if os.path.exists(path):
@@ -83,31 +108,92 @@ class SealedStore:
                 )
                 os.replace(path, qpath)
                 self._entries = {}
+        self._recover_incomplete_entries()
 
-    def _persist_locked(self) -> None:
-        archived_entries = {
-            audit_id: self._archive_entry(entry)
-            for audit_id, entry in self._entries.items()
-        }
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(archived_entries, fh, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
+    # ------------------------------------------------------------------
+    # Legacy recovery
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _archive_entry(entry: dict) -> dict:
-        archived = json.loads(json.dumps(entry))
-        conclusion = archived.get("conclusion", {})
+    def _missing_accept_evidence(conclusion: Any) -> bool:
+        """True for accept conclusions stripped of their tree evidence."""
+        if not isinstance(conclusion, dict):
+            return False
         verdict = conclusion.get("verdict")
         if verdict == "UNIQUE_ACCEPTED":
-            tree = conclusion.pop("tree", None)
-            if tree is not None:
-                conclusion["archived_tree"] = True
+            return not isinstance(conclusion.get("tree"), dict)
+        if verdict == "AMBIGUOUS_ACCEPTED":
+            trees = conclusion.get("trees")
+            return not (isinstance(trees, dict)
+                        and isinstance(trees.get("first"), dict)
+                        and isinstance(trees.get("second"), dict))
+        return False
+
+    def _recover_entry(self, entry: dict) -> Optional[dict]:
+        """Rebuild a legacy entry's full conclusion from its frozen input.
+
+        Returns the recovered entry, or ``None`` when recovery is not
+        possible or the recomputed evidence does not exactly match the
+        sealed remnants (in which case the original entry must be kept
+        untouched).
+        """
+        if self._recompute is None:
+            return None
+        conclusion = entry.get("conclusion")
+        canonical = entry.get("canonical_request")
+        if not isinstance(conclusion, dict) or not isinstance(canonical, dict):
+            return None
+        try:
+            fresh = self._recompute(canonical)
+        except Exception:  # noqa: BLE001 - never let recovery break startup
+            return None
+        if not isinstance(fresh, dict):
+            return None
+        verdict = conclusion.get("verdict")
+        if fresh.get("verdict") != verdict:
+            return None
+        # Safety anchor: the recomputed conclusion must reproduce the
+        # sealed production-id sequence(s) exactly before its trees are
+        # trusted as the original evidence.
+        if verdict == "UNIQUE_ACCEPTED":
+            if fresh.get("production_sequence") != conclusion.get("production_sequence"):
+                return None
         elif verdict == "AMBIGUOUS_ACCEPTED":
-            trees = conclusion.pop("trees", None)
-            if trees is not None:
-                conclusion["archived_witnesses"] = sorted(trees)
-        return archived
+            if (fresh.get("production_sequences")
+                    != conclusion.get("production_sequences")):
+                return None
+        else:
+            return None
+        if self._missing_accept_evidence(fresh):
+            return None
+        recovered = json.loads(json.dumps(entry))
+        recovered["conclusion"] = fresh
+        return recovered
+
+    def _recover_incomplete_entries(self) -> None:
+        """Restore tree evidence for legacy archived entries, once."""
+        changed = False
+        for audit_id, entry in list(self._entries.items()):
+            if not isinstance(entry, dict):
+                continue
+            if not self._missing_accept_evidence(entry.get("conclusion")):
+                continue
+            recovered = self._recover_entry(entry)
+            if recovered is not None:
+                self._entries[audit_id] = recovered
+                changed = True
+        if changed:
+            # Persist the recovery so subsequent restarts stay complete.
+            with self._lock:
+                self._persist_locked()
+
+    # ------------------------------------------------------------------
+
+    def _persist_locked(self) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self._entries, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
 
     def get(self, audit_id: str) -> Optional[dict]:
         with self._lock:

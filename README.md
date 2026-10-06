@@ -32,6 +32,12 @@
 - 新审计标识：计算并封存结论（`SEALED`），落盘到 `/data/sealed.json`（原子替换）。
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
+- **完整证据跨重启保持**：唯一树 / 两棵歧义见证树作为封存结论的一部分原样落盘；
+  保持数据卷不变重启后，按审计标识读取或等价重传仍返回完整派生树、产生式编号序列与跨度。
+- **遗留恢复**：旧版本封存的记录可能缺失树证据（留有 `archived_tree` / `archived_witnesses`
+  裁剪标记）。服务启动时依据其冻结的规范化输入重算，仅当重算的裁决与产生式编号序列和
+  封存残迹完全一致时才采纳恢复结果并落盘；否则原记录保持不动。恢复不改变审计标识、
+  请求指纹、封存时间、拒绝结论或冲突时保留的原始证据。
 
 ## HTTP
 
@@ -64,6 +70,8 @@
 ```bash
 # 自动先构建镜像、等待 arbiter 健康，再在 verify 内执行：
 # 单元测试 -> 显式镜像构建 -> 唯一/歧义/无消费环（含回放、冲突）HTTP 冒烟
+# -> 保留数据卷重启 arbiter 后校验读取与等价重传的完整树证据
+# -> 注入遗留裁剪封存、再两次重启确认安全恢复且恢复结果持久化
 docker compose run --rm --build verify
 echo "verify 退出码：$?"
 ```
@@ -80,7 +88,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 52 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
@@ -90,7 +98,7 @@ ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整�
 ```
 app/grammar.py    请求结构校验（限制/非法符号/悬空引用/首个原因）
 app/engine.py     静态分析（可生成性、不消费词元循环）+ Earley/SPPF 构建 + 稳定选树
-app/storage.py    语义指纹、封存、回放、冲突保留
+app/storage.py    语义指纹、封存、回放、冲突保留、完整证据持久化与遗留恢复
 app/service.py    HTTP 服务
 tests/            引擎/封存/HTTP 单元测试
 scripts/          verify.py（冒烟）与 entrypoint.sh（验收编排）
