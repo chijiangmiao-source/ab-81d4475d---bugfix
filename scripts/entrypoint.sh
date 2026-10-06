@@ -6,7 +6,11 @@
 #   3. HTTP smoke against ARBITER_BASE_URL (in Compose: the healthy
 #      "arbiter" service): unique / ambiguous / non-consuming-cycle,
 #      plus sealed replay and audit-id conflict
-#   4. exit 0 on full success, 1 otherwise
+#   4. the driver then restarts the arbiter twice (keeping its data
+#      volume), verifies post-restart reads and equivalent
+#      retransmissions carry the full derivation trees, and that legacy
+#      records stripped of trees are recovered and stay persisted
+#   5. exit 0 on full success, 1 otherwise
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 2
@@ -27,15 +31,23 @@ if docker info >/dev/null 2>&1; then
   docker image inspect "$IMAGE" >/dev/null && echo "镜像 $IMAGE 已就绪"
 elif [ "${ALLOW_LOCAL_FALLBACK:-0}" = "1" ]; then
   echo "警告：Docker daemon 不可用，回退为本地子进程冒烟（不验证镜像构建）" >&2
+  # Stop any stale instance from a previous local run so the data
+  # directory and port 18080 are ours.
+  if [ -f /tmp/arbiter.pid ]; then
+    kill "$(cat /tmp/arbiter.pid)" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -rf /tmp/arbiter-data
   mkdir -p /tmp/arbiter-data
   ARBITER_STORE=/tmp/arbiter-data/sealed.json ARBITER_PORT=18080 \
     python3 -m app.service >/tmp/arbiter.log 2>&1 &
+  echo $! > /tmp/arbiter.pid
   export ARBITER_BASE_URL="http://127.0.0.1:18080"
 else
   echo "无法连接 Docker daemon（/var/run/docker.sock），无法执行镜像构建" >&2
   exit 1
 fi
 
-echo "================ [3/3] HTTP 场景冒烟（唯一/歧义/无消费环/回放/冲突）================"
+echo "================ [3/3] HTTP 场景冒烟（唯一/歧义/无消费环/回放/冲突/保卷重启/旧记录恢复）================"
 echo "目标服务：${ARBITER_BASE_URL:?需设置 ARBITER_BASE_URL}"
 SKIP_UNIT_TESTS=1 python3 scripts/verify.py

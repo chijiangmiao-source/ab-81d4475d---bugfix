@@ -15,6 +15,14 @@ fingerprint.  Rules:
 
 The store is a single JSON file replaced atomically; a process-wide lock
 serializes writes.  Sealed entries are immutable.
+
+Persistence preserves the *complete* reviewable evidence -- verdict,
+preorder production-id sequences, spans and full derivation trees -- so a
+reviewer reopening the service after a restart gets node-by-node
+identical conclusions.  Records sealed by older builds that persisted
+verdicts without trees are recovered at load time from their frozen
+canonical input (audit id, request fingerprint, seal timestamp and the
+adjudicated verdict are never altered).
 """
 
 from __future__ import annotations
@@ -25,6 +33,14 @@ import os
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
+
+from . import engine
+from .grammar import ValidationError, build_grammar
+
+# Conclusions carry node-by-node derivation evidence that must survive
+# sealing and process restarts.
+_UNIQUE = "UNIQUE_ACCEPTED"
+_AMBIGUOUS = "AMBIGUOUS_ACCEPTED"
 
 
 class ConflictError(Exception):
@@ -83,31 +99,128 @@ class SealedStore:
                 )
                 os.replace(path, qpath)
                 self._entries = {}
+            else:
+                # Records sealed by older builds may lack derivation
+                # trees; safely rebuild them from the frozen input so the
+                # evidence stays reviewable across every later reopen.
+                with self._lock:
+                    if self._recover_incomplete_locked():
+                        try:
+                            self._persist_locked()
+                        except OSError:
+                            # Read-only volume: the recovery still holds
+                            # for this process; a later writable reopen
+                            # retries the same reconstruction.
+                            pass
 
-    def _persist_locked(self) -> None:
-        archived_entries = {
-            audit_id: self._archive_entry(entry)
-            for audit_id, entry in self._entries.items()
-        }
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(archived_entries, fh, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
+    # ------------------------------------------------------------------
+    # Evidence completeness and recovery
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _archive_entry(entry: dict) -> dict:
-        archived = json.loads(json.dumps(entry))
-        conclusion = archived.get("conclusion", {})
+    def _evidence_complete(entry: dict) -> bool:
+        """A sealed entry is reviewable only with its full trees."""
+        conclusion = entry.get("conclusion") or {}
         verdict = conclusion.get("verdict")
-        if verdict == "UNIQUE_ACCEPTED":
-            tree = conclusion.pop("tree", None)
-            if tree is not None:
-                conclusion["archived_tree"] = True
-        elif verdict == "AMBIGUOUS_ACCEPTED":
-            trees = conclusion.pop("trees", None)
-            if trees is not None:
-                conclusion["archived_witnesses"] = sorted(trees)
-        return archived
+        if verdict == _UNIQUE:
+            return isinstance(conclusion.get("tree"), dict)
+        if verdict == _AMBIGUOUS:
+            trees = conclusion.get("trees")
+            return (
+                isinstance(trees, dict)
+                and isinstance(trees.get("first"), dict)
+                and isinstance(trees.get("second"), dict)
+            )
+        # REJECTED conclusions carry no derivation trees.
+        return True
+
+    @staticmethod
+    def _recompute_conclusion(canonical: dict) -> dict:
+        """Recompute a conclusion from a frozen canonical request.
+
+        The canonical object has exactly the submission shape (it was the
+        input of :func:`canonical_fingerprint`), so it rebuilds the
+        grammar directly.
+        """
+        grammar = build_grammar(canonical)
+        try:
+            return engine.analyze(grammar)
+        except engine.EngineError as exc:
+            return {
+                "verdict": engine.REJECTED,
+                "rejection": {
+                    "reason": exc.reason,
+                    "detail": exc.detail,
+                    **({"evidence": exc.extra} if exc.extra else {}),
+                },
+            }
+
+    def _recover_incomplete_locked(self) -> bool:
+        """Restore missing trees of legacy records from frozen input.
+
+        Only the ``conclusion`` is rebuilt.  Audit id, request
+        fingerprint, seal timestamp and the adjudicated verdict are
+        immutable: a reconstructed conclusion is accepted only when its
+        verdict and the previously stored stable production-id sequences
+        match exactly, otherwise the record is left untouched.
+        """
+        recovered_any = False
+        for audit_id, entry in list(self._entries.items()):
+            if self._evidence_complete(entry):
+                continue
+            old = entry.get("conclusion") or {}
+            canonical = entry.get("canonical_request")
+            try:
+                if not isinstance(canonical, dict):
+                    continue
+                # The frozen input must still hash to the sealed
+                # fingerprint; otherwise it is not safe to rebuild.
+                fp, _ = canonical_fingerprint(canonical)
+                if fp != entry.get("request_hash"):
+                    continue
+                rebuilt = self._recompute_conclusion(canonical)
+            except (ValidationError, KeyError, TypeError, ValueError):
+                continue
+            if rebuilt.get("verdict") != old.get("verdict"):
+                continue
+            if not self._sequences_match(old, rebuilt):
+                continue
+            restored = json.loads(json.dumps(entry))
+            restored["conclusion"] = rebuilt
+            self._entries[audit_id] = restored
+            recovered_any = True
+        return recovered_any
+
+    @staticmethod
+    def _sequences_match(old: dict, rebuilt: dict) -> bool:
+        """Guard stability using the sequences the old record retained."""
+        verdict = rebuilt.get("verdict")
+        if verdict == _UNIQUE:
+            return (
+                old.get("production_sequence")
+                == rebuilt.get("production_sequence")
+            )
+        if verdict == _AMBIGUOUS:
+            return (
+                old.get("production_sequences")
+                == rebuilt.get("production_sequences")
+            )
+        return True
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _persist_locked(self) -> None:
+        # Complete evidence is persisted verbatim: verdict, production-id
+        # sequences, spans and every derivation tree must survive a
+        # restart for node-by-node re-review.
+        stored_entries = json.loads(json.dumps(self._entries))
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(stored_entries, fh, ensure_ascii=False, indent=2,
+                      sort_keys=True)
+        os.replace(tmp, self.path)
 
     def get(self, audit_id: str) -> Optional[dict]:
         with self._lock:

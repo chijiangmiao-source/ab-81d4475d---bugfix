@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -118,6 +119,86 @@ class TestService(unittest.TestCase):
         self.assertEqual(b["result"]["verdict"], "AMBIGUOUS_ACCEPTED")
         self.assertEqual(b["result"]["production_sequences"],
                          {"first": [1], "second": [2]})
+
+
+class TestPersistenceAcrossRestart(unittest.TestCase):
+    """A reopened server over the same store must return full trees."""
+
+    def _serve(self, tmp):
+        path = os.path.join(tmp, "sealed.json")
+        httpd, _ = make_server("127.0.0.1", 0, SealedStore(path))
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        return httpd, thread, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    @staticmethod
+    def _post(base, payload):
+        req = urllib.request.Request(
+            base + "/api/v1/analyze",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    @staticmethod
+    def _get(base, path):
+        with urllib.request.urlopen(base + path, timeout=5) as r:
+            return r.status, json.loads(r.read())
+
+    def test_full_trees_survive_server_restart(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(tmp, True))
+
+        unique = {
+            "audit_id": "R-U", "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["a", "b"]}],
+            "start": "S", "tokens": ["a", "b"],
+        }
+        ambiguous = {
+            "audit_id": "R-A", "nonterminals": ["S"],
+            "productions": [{"id": 1, "lhs": "S", "rhs": ["a"]},
+                            {"id": 2, "lhs": "S", "rhs": ["a"]}],
+            "start": "S", "tokens": ["a"],
+        }
+
+        httpd, thread, base = self._serve(tmp)
+        try:
+            s, b1 = self._post(base, unique)
+            self.assertEqual(s, 200)
+            s, b2 = self._post(base, ambiguous)
+            self.assertEqual(s, 200)
+            tree = b1["result"]["tree"]
+            witnesses = b2["result"]["trees"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        # Reopen: brand new process-equivalent server over the same file.
+        httpd, thread, base = self._serve(tmp)
+        try:
+            s, body = self._get(base, "/api/v1/conclusion/R-U")
+            self.assertEqual(s, 200)
+            self.assertEqual(body["conclusion"]["tree"], tree)
+            self.assertEqual(
+                body["conclusion"]["production_sequence"], [1])
+
+            s, body = self._get(base, "/api/v1/conclusion/R-A")
+            self.assertEqual(s, 200)
+            self.assertEqual(body["conclusion"]["trees"], witnesses)
+
+            # Equivalent retransmission after restart replays full trees.
+            s, body = self._post(base, ambiguous)
+            self.assertEqual(s, 200)
+            self.assertEqual(body["seal_status"], "REPLAYED")
+            self.assertEqual(body["result"]["trees"], witnesses)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

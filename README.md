@@ -30,8 +30,16 @@
 ## 审计封存
 
 - 新审计标识：计算并封存结论（`SEALED`），落盘到 `/data/sealed.json`（原子替换）。
+  落盘内容为**完整可复核证据**：裁决、先序产生式编号序列、跨度与整棵（或两棵）派生树，
+  因此保留数据卷重启后按标识读取、语义等价重传都返回逐节点一致的树，而非只剩裁决。
 - 同标识 + 语义等价重传（与声明/产生式数组顺序无关，仅与内容有关）：回放原结论（`REPLAYED`），不重新计算。
 - 同标识 + 不同输入：`HTTP 409 AUDIT_ID_CONFLICT`，**保留并回传原证据**。
+- **旧记录恢复**：早期版本曾只把裁决与编号序列落盘、剥离树本体（`archived_tree` /
+  `archived_witnesses` 标记）。服务加载封存文件时会依据每条记录的**冻结输入**
+  （`canonical_request`）安全重建缺失的树：先复算语义指纹确认与封存指纹一致，再校验
+  复算裁决与保留的稳定编号序列完全一致，然后才在内存中补全并原子写回。
+  审计标识、请求指纹、封存时间、拒绝结论一律不变；指纹不符或序列不一致的记录保持原样，
+  绝不臆造证据。
 
 ## HTTP
 
@@ -64,6 +72,8 @@
 ```bash
 # 自动先构建镜像、等待 arbiter 健康，再在 verify 内执行：
 # 单元测试 -> 显式镜像构建 -> 唯一/歧义/无消费环（含回放、冲突）HTTP 冒烟
+# -> 保留数据卷重启（注入两份树被剥离的旧封存）-> 重启后读取/等价重传树结构
+#    与稳定编号序列、冲突保留原证据、旧记录恢复 -> 再次重开确认恢复已持久化
 docker compose run --rm --build verify
 echo "verify 退出码：$?"
 ```
@@ -80,7 +90,7 @@ docker compose down -v   # 清理
 ## 本地开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -v       # 40 项单元测试
+python3 -m unittest discover -s tests -v       # 49 项单元测试
 python3 -m app.service                          # 直接启动服务
 ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整验收
 ```
@@ -90,10 +100,11 @@ ALLOW_LOCAL_FALLBACK=1 bash scripts/entrypoint.sh  # 无 Docker 时本地完整�
 ```
 app/grammar.py    请求结构校验（限制/非法符号/悬空引用/首个原因）
 app/engine.py     静态分析（可生成性、不消费词元循环）+ Earley/SPPF 构建 + 稳定选树
-app/storage.py    语义指纹、封存、回放、冲突保留
+app/storage.py    语义指纹、完整证据封存、回放、冲突保留、旧记录冻结输入恢复
 app/service.py    HTTP 服务
-tests/            引擎/封存/HTTP 单元测试
-scripts/          verify.py（冒烟）与 entrypoint.sh（验收编排）
+tests/            引擎/封存（含保卷持久化与旧记录恢复）/HTTP 单元测试
+scripts/          verify.py（冒烟与保卷重启）、seed_legacy.py（旧格式封存注入）
+                   与 entrypoint.sh（验收编排）
 Dockerfile        仲裁服务镜像
 Dockerfile.verify 验收镜像（Python + 静态 docker CLI）
 docker-compose.yml
